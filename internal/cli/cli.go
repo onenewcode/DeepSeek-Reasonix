@@ -297,8 +297,15 @@ func runAgent(args []string) int {
 	cfg, _ := config.Load()
 	configureCLIThemeFromConfigForTTYOutput()
 
+	// fs.Parse 已经把命令行里的 flag（如 --model / --max-steps）消费掉了；
+	// 这里的 fs.Args() 只剩“用户真正想让 agent 执行的正文参数”。
+	// 例如：
+	//   reasonix run --model x fix login bug
+	// 会得到 []string{"fix", "login", "bug"}，随后用空格重新拼成一条 prompt。
 	prompt := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if prompt == "" {
+		// 如果命令行正文为空，就回退到 stdin。
+		// 这样既支持 `reasonix run "do x"`，也支持 `echo "do x" | reasonix run`。
 		prompt = readStdin()
 	}
 	if prompt == "" {

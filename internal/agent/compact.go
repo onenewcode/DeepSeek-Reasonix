@@ -187,7 +187,28 @@ func estimateTextTokens(s string) int {
 // summarize so the UI can show a "compacting…" placeholder, and a Done event
 // (carrying the summary) replaces it.
 func (a *Agent) compact(ctx context.Context, trigger, instructions string, force bool) error {
+	// 中文说明：这里的“压缩”不是把整个 session 粗暴缩成一段摘要，
+	// 而是采用“三段式折叠”：
+	// 1. 前缀保留区：system prompt、可安全 pin 住的首个用户回合、以及之前生成过的摘要，原样保留；
+	// 2. 中间折叠区：较早的 assistant/tool/大块用户内容，提炼成一个新的 summary；
+	// 3. 最近尾部：离当前任务最近的一段消息按 token 预算原样保留，避免刚做完的上下文丢失。
+	//
+	// 最终 session 会变成：
+	//   [前缀原文] + [保留的关键用户消息] + [一条 compaction summary] + [最近 tail 原文]
+	// 这能同时兼顾：
+	// - 保住用户原始约束；
+	// - 回收旧工具输出占用的上下文；
+	// - 让模型继续看到最近的执行现场。
 	msgs := a.session.Messages
+
+	// 第一步：先规划“压缩边界”。
+	// planCompaction 会算出：
+	// - head: 前面必须原样保留到哪；
+	// - start: 最近 tail 从哪开始；
+	// 因而 msgs[head:start] 就是候选压缩区。
+	//
+	// 正常情况下要求候选区至少有 minCompactMessages 条消息，
+	// 但如果历史里只有一条超大的消息，也允许退化成“压缩 1 条”的模式。
 	head, start, ok := a.planCompaction(msgs, minCompactMessages)
 	if !ok {
 		// A single huge message can still be worth folding. Keep the normal
@@ -203,6 +224,13 @@ func (a *Agent) compact(ctx context.Context, trigger, instructions string, force
 	// Base layer: every small user turn in the region is kept verbatim (the
 	// deterministic floor — a fact the user stated is never summarized away,
 	// wherever in the session they said it); only the rest folds into the digest.
+	//
+	// 第二步：把候选压缩区再拆成 kept / fold 两部分。
+	// - kept: 需要原样留下的消息，例如：
+	//   * 小型用户回合（用户亲口说的事实/约束不希望只剩摘要）
+	//   * 之前已有的 compaction summary（避免“摘要再摘要”导致信息漂移）
+	//   * keep policy 指定必须保留的内容（如错误、手工标记保留内容）
+	// - fold: 真正送去摘要器压缩的那部分旧消息
 	kept, fold := a.partitionFold(region)
 	if len(fold) == 0 {
 		return nil // nothing but kept user turns — a fold would save nothing
@@ -210,6 +238,10 @@ func (a *Agent) compact(ctx context.Context, trigger, instructions string, force
 
 	// Economic check on the foldable part (kept user turns don't count toward the
 	// savings): skip if too small to justify the call, unless force demands it.
+	//
+	// 第三步：做“值不值得压”的经济判断。
+	// 如果 fold 很小，调用一次 summarizer 带来的 token/延迟成本可能比节省还高，
+	// 这时直接跳过；但 manual /compact 或 force 高水位触发时会强制压缩。
 	if !force && !foldEconomics(fold) {
 		return nil
 	}
@@ -218,6 +250,10 @@ func (a *Agent) compact(ctx context.Context, trigger, instructions string, force
 
 	// A PreCompact hook can steer what the summary keeps; its stdout joins any
 	// explicit /compact <focus> text.
+	//
+	// 第四步：收集“摘要提示词”。
+	// 用户通过 `/compact <focus>` 指定的重点，和 PreCompact hook 给出的额外提示，
+	// 会一起传给 summarizer，告诉它这次压缩更该保留哪些信息。
 	if a.hooks != nil {
 		if hookInstr := a.hooks.PreCompact(ctx, trigger); hookInstr != "" {
 			if instructions != "" {
@@ -241,16 +277,30 @@ func (a *Agent) compact(ctx context.Context, trigger, instructions string, force
 	// are spliced back verbatim, so a fact that reached a digest once is never
 	// re-summarized away and the user's own words are never touched. Digests
 	// accumulate (small) rather than collapsing into one lossy rolling summary.
+	//
+	// 第五步：真正生成摘要。
+	// summarizeWithRetry 会把 fold 区域渲染成 transcript，交给同一个 provider
+	// 生成结构化摘要；如果第一次失败，会在非超时场景下重试一次。
 	summary, err := a.summarizeWithRetry(ctx, fold, instructions)
 	if err != nil {
 		// Mechanical fold: the foldable region is already archived, so stand in a
 		// deterministic marker rather than aborting. /compact then always frees
 		// context (and auto-compaction can't loop on a still-full window); the
 		// verbatim user turns kept above are untouched.
+		//
+		// 如果摘要器不可用，不会放弃压缩，而是退化到“机械压缩”：
+		// 用一条固定说明替代真实 summary，告诉后续模型：
+		// - 这里有一段更早的消息已经被折叠；
+		// - 原文已归档；
+		// - 需要细节时应回头问用户。
+		// 这样至少能稳定释放上下文，避免因压缩失败而一直卡在超长窗口。
 		a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "compaction summary unavailable (" + err.Error() + "); folded mechanically"})
 		summary = mechanicalFoldDigest(len(fold), archived)
 	}
 
+	// 第六步：把 session 原地重写成“前缀 + kept + summary + recent tail”。
+	// 注意 summary 是作为一条 user message 写回，并包上 <compaction-summary> 标签，
+	// 这样后续模型能识别它是压缩摘要，而不是当前用户新提的真实需求。
 	compacted := make([]provider.Message, 0, head+len(kept)+1+len(msgs)-start)
 	compacted = append(compacted, msgs[:head]...)
 	compacted = append(compacted, kept...)
@@ -265,6 +315,7 @@ func (a *Agent) compact(ctx context.Context, trigger, instructions string, force
 	a.session.Replace(compacted)
 	a.session.IncrementRewrite()
 
+	// 最后发出完成事件，供 UI/日志展示压缩了多少消息、摘要内容是什么、归档放在哪。
 	a.sink.Emit(event.Event{Kind: event.CompactionDone, Compaction: event.Compaction{
 		Trigger: trigger, Messages: len(fold), Summary: summary, Archive: archived,
 	}})

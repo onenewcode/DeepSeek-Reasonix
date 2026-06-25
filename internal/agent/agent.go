@@ -643,45 +643,100 @@ func usageSourceOrDefault(source, fallback string) string {
 // a round count. A positive maxSteps imposes an optional hard guard, surfaced as
 // a resumable notice when hit.
 func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
+	// 中文流程总览：
+	// 1. 先清理/重置本轮运行需要的瞬时状态，确保这次 Run 不会继承上一次的中途控制痕迹。
+	// 2. 处理用户输入：按需要注入 reasoning language、memory compiler 改写结果、图片等上下文。
+	// 3. 把用户消息写入 session，然后进入主循环：每一轮都让模型流式输出一次。
+	// 4. 如果模型要求调用工具，就执行工具、把结果写回 session，再继续下一轮。
+	// 5. 如果模型不再调用工具，就把这次输出当作“候选最终答案”，做一系列兜底校验：
+	//    - 最终答案是否满足 readiness 要求；
+	//    - 是否真的有可见的最终回答；
+	//    - executor handoff 场景下是否其实什么动作都没做。
+	// 6. 满足结束条件就返回 nil；如果中途流式输出出错、上下文取消、或到达步数上限，就返回对应错误。
+
+	// 无论函数以哪种路径退出，都要把本轮残留的 steer 指令队列清空，
+	// 避免影响下一次 Run。
 	defer a.clearSteerQueue()
+
+	// steerConsumed 是“本轮是否已经消费过中途引导指令”的标记；
+	// Run 开始时必须复位，这样新的 steer 才能按预期生效。
 	a.steerMu.Lock()
 	a.steerConsumed = false
 	a.steerMu.Unlock()
+
+	// evidence 记录的是本轮执行过程中收集到的 todo、验证、命令回执等证据；
+	// 进入新一轮对话前需要清空，避免把上一轮的完成状态误判到本轮。
 	if a.evidence != nil {
 		a.evidence.Reset()
 	}
+
+	// repeatSuccessCounts 用来追踪重复成功模式；每次 Run 都重新开始计数。
 	a.repeatSuccessCounts = nil
+
+	// 向外部事件系统声明“一个新的 turn 开始了”，UI/日志/上层调度器都可能依赖这个事件。
 	a.sink.Emit(event.Event{Kind: event.TurnStarted})
+
+	// rawInput 保留用户原始输入；后面 input 可能会被补充语言要求或被 memory compiler 改写，
+	// 所以这里先把最原始的文本单独保存下来。
 	rawInput := input
 	memoryCompilerInput := rawInput
+
+	// 某些调用链会把更适合 memory compiler 理解的源输入塞进 context；
+	// 如果拿到了，就优先把它作为 memory compiler 的输入，但最终写入 session 的仍可能是改写后的 input。
 	if sourceInput, ok := MemoryCompilerSourceInputFromContext(ctx); ok {
 		memoryCompilerInput = sourceInput
 	}
+
+	// 给用户输入补上推理语言约束，让模型用 Agent 当前约定的语言进行思考/响应。
 	input = a.withReasoningLanguage(rawInput)
+
+	// 如果启用了 memory compiler，这里会尝试在“正式问模型之前”先做一次输入编译：
+	// 它可能把原始输入改写成更结构化、更利于执行的版本，同时开启一个 turn 级别的统计/生命周期对象。
 	if memCompiler := a.memoryCompilerRuntime(); memCompiler != nil {
 		if compiledInput, turn := memCompiler.StartTurn(ctx, memoryCompilerInput, a.session.Snapshot()); turn != nil {
+			// 把当前 compiler turn 挂到 Agent 上，便于运行期间其他逻辑读取统计信息。
 			a.compilerTurn = turn
 			a.emitMemoryCompilerStats(turn)
 			defer func() {
+				// Run 结束时，无论成功还是失败，都把最终 runErr 回传给 compiler turn，
+				// 让它完成统计归档/学习写回/资源释放。
 				turn.Finish(runErr)
 				if a.compilerTurn == turn {
 					a.compilerTurn = nil
 				}
 			}()
 			if strings.TrimSpace(compiledInput) != "" {
+				// 只有 compiler 真正产出了非空改写结果，才覆盖原始 input；
+				// 并再次补 reasoning language，确保改写后的文本也遵守语言约束。
 				input = a.withReasoningLanguage(compiledInput)
 			}
 		}
 	}
+
+	// 把这次用户输入正式写入会话历史。后续每一轮请求模型时，都会基于这份 session 快照构造 prompt。
 	a.session.Add(provider.Message{Role: provider.RoleUser, Content: input, Images: userImages(ctx)})
 
+	// 下面这些变量都是“本次 Run 主循环”的运行时状态：
+	// - finalReadinessBlocks: 最终答案因 readiness 校验失败而被打回的次数。
+	// - emptyFinalBlocks: 模型声称结束但没有可见答案的次数。
+	// - handoffNudges: executor handoff 场景下，对“你还没真正执行动作”进行提醒的次数。
+	// - usedAnyTool: 这一轮 Run 里是否至少调用过一次工具。
+	// - streamRecoveries: 流式输出被中断后的自动恢复次数。
+	// - graceRound: 当工具调用预算耗尽后，是否已经进入“最后一次只允许总结回答”的宽限轮。
 	finalReadinessBlocks := 0
 	emptyFinalBlocks := 0
 	handoffNudges := 0
 	usedAnyTool := false
 	streamRecoveries := 0
 	graceRound := false
+
+	// executorHandoffGuard + marker 组合用于识别“这是由上层 executor 转交过来的任务”；
+	// 这类任务如果模型直接空口回答、完全不动工具，后面会额外施加一次提醒。
 	executorHandoff := a.executorHandoffGuard && strings.Contains(input, executorHandoffMarker)
+
+	// 主循环：每一轮代表一次“把当前 session 发给模型 -> 收到模型输出 -> 决定继续调工具还是结束”。
+	// 当 maxSteps <= 0 时不限制轮数；否则受 maxSteps 约束。
+	// graceRound 为 true 时，即便已经到达 maxSteps，也额外允许再跑一轮，让模型生成最终总结。
 	for step := 0; a.maxSteps <= 0 || step < a.maxSteps || graceRound; step++ {
 		// Consume a queued steer and persist it to the session so it
 		// survives tab switches and history replay. The model sees it as
@@ -691,6 +746,9 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 			a.session.Add(provider.Message{Role: provider.RoleUser, Content: a.withReasoningLanguage(midTurnSteerMessage(text))})
 			a.sink.Emit(event.Event{Kind: event.Steer, Text: text})
 		}
+
+		// 工具 schema 会进入本轮 prompt；这里先抓取“本轮 prompt 前缀的形状”，
+		// 后面可与上一轮对比，用来分析缓存命中/失效原因。
 		schemas := a.tools.Schemas()
 		prefixShape := a.capturePrefixShape(schemas)
 		prevPrefixShape := a.lastPrefixShape
@@ -698,11 +756,21 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 			prevPrefixShape = prefixShape
 		}
 
+		// stream 是本函数最核心的一步：
+		// 它会把当前 session 发给模型，流式接收回答，并最终解析出：
+		// - text: 模型对用户可见的文本
+		// - reasoning/signature: 推理内容及签名
+		// - calls: 本轮想调用的工具列表
+		// - usage: token 用量
+		// - interrupted/partialToolStarted: 是否被中断，以及工具调用是否已经部分开始
 		text, reasoning, signature, calls, usage, interrupted, partialToolStarted, err := a.stream(ctx, step+1)
 		if err != nil {
+			// 如果是“可恢复的流中断”，Agent 不会立刻失败，而是尝试自动补救。
 			if interrupted && streamRecoveries < maxStreamRecoveries {
 				streamRecoveries++
 				if hasVisibleFinalAnswer(text) {
+					// 某些中断场景下，模型其实已经输出了一部分可见答案；
+					// 先把可见部分存进 session，避免恢复时白白丢失。
 					a.session.Add(provider.Message{
 						Role:               provider.RoleAssistant,
 						Content:            text,
@@ -716,22 +784,30 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 					Content: a.withReasoningLanguage(streamRecoveryMessage(hasVisibleFinalAnswer(text), partialToolStarted)),
 				})
 				a.sink.Emit(event.Event{Kind: event.Retrying, RetryAttempt: streamRecoveries, RetryMax: maxStreamRecoveries})
+
+				// 恢复重试不应该消耗用户配置的 maxSteps 预算，所以这里把 step 回退一轮。
 				step-- // recovery retries do not consume the tool-round maxSteps budget
 				continue
 			}
 			return err
 		}
+
+		// 一旦本轮 stream 成功，说明恢复链路已经闭环，恢复计数归零。
 		streamRecoveries = 0
+
+		// 记录本轮 prompt 形状与上一轮的差异，帮助分析 token cache 为什么命中/失效。
 		cacheDiagnostics := CompareShape(prevPrefixShape, prefixShape, usage)
 		a.lastPrefixShape = prefixShape
 		a.haveLastPrefixShape = true
 		if usage != nil && usage.TotalTokens > 0 {
+			// 如果 provider 提供了 token 用量，就发 usage 事件给 UI/日志/计费层。
 			a.sink.Emit(event.Event{Kind: event.Usage, Usage: usage, Pricing: a.pricing,
 				UsageSource:      a.usageSource,
 				CacheDiagnostics: &cacheDiagnostics,
 				SessionHit:       int(a.sessCacheHit.Load()), SessionMiss: int(a.sessCacheMiss.Load())})
 		}
 		if msg, ok := finishReasonMessage(usage); ok {
+			// 某些 finish reason 代表需要提醒用户/上层，例如输出被截断、资源边界等。
 			a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: msg})
 		}
 
@@ -750,11 +826,16 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 		})
 
 		if len(calls) == 0 {
+			// 走到这里说明模型“这轮不想再调工具了”，Agent 会把当前输出当作最终答案候选，
+			// 但不会立刻结束，而是做一串安全检查，避免模型过早收尾或空答复。
 			readiness := a.finalReadinessCheck()
 			if readiness.reason != "" {
+				// readiness 失败常见于：todo 没做完、写代码后没跑要求的验证命令等。
+				// 这时不是直接失败，而是把失败原因反馈给模型，让它继续补作业。
 				finalReadinessBlocks++
 				result := evidence.ReadinessBlocked
 				if finalReadinessBlocks >= maxFinalReadinessBlocks {
+					// 多次提醒后仍然无法满足 readiness，说明已经陷入无效循环，直接报错退出。
 					result = evidence.ReadinessErrored
 					event.RecordReadinessAudit(a.sink, readiness.audit(result, false))
 					return fmt.Errorf("final-answer readiness failed %d times: %s", finalReadinessBlocks, readiness.reason)
@@ -766,6 +847,8 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 				continue
 			}
 			if !hasVisibleFinalAnswer(text) {
+				// 模型可能只输出了 reasoning 或格式噪音，但没有真正对用户可见的答案；
+				// 这种情况要显式要求它补一条可见最终答复。
 				emptyFinalBlocks++
 				if emptyFinalBlocks >= maxEmptyFinalBlocks {
 					return fmt.Errorf("model finished without a visible final answer %d times", emptyFinalBlocks)
@@ -776,6 +859,8 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 				continue
 			}
 			if executorHandoff && !usedAnyTool && handoffNudges < maxExecutorHandoffNudges && shouldNudgeExecutorHandoff(input, text) {
+				// handoff 场景里，如果模型没有调用任何工具就直接回答，通常意味着它没有真正执行任务；
+				// 这里会再推它一次，明确要求“先采取动作，再给结论”。
 				handoffNudges++
 				a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "executor answered without taking any action; nudging it to use its tools"})
 				a.session.Add(provider.Message{Role: provider.RoleUser, Content: a.withReasoningLanguage(executorHandoffRetryMessage())})
@@ -783,28 +868,40 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 				continue
 			}
 			if readiness.applies {
+				// 只要这轮答案经过了 readiness 体系，就把“允许收尾”的审计结果记录下来。
 				event.RecordReadinessAudit(a.sink, readiness.audit(evidence.ReadinessAllowed, finalReadinessBlocks > 0))
 			}
 			if a.steerQueueLen() > 0 {
+				// 即便模型已经给出最终答案，只要外部又塞进来了新的 steer，
+				// 就优先继续跑下一轮，让模型先消费这条引导，而不是立刻返回。
 				continue
 			}
 			// A final-answer turn otherwise skips compaction, so a large context
 			// carries into the next turn un-folded and can overflow the model window.
 			// No-op below the trigger, so normal turns keep their warm cache.
 			a.maybeCompact(ctx, usage)
+
+			// 真正满足“无工具调用 + readiness 通过 + 有可见答案 + 无待消费 steer”后，
+			// 本次 Run 才算正常结束。
 			return nil // model gave a final answer
 		}
 		emptyFinalBlocks = 0
+
+		// 只要出现过工具调用，就说明这是一次“行动过”的执行，不再属于空回答。
 		usedAnyTool = true
 
 		// Grace round guard: if we already gave the model one extra response
 		// and it still wants to call tools, stop here.
 		if graceRound {
+			// 宽限轮的目的是“只允许总结，不允许继续扩张工作量”；
+			// 所以如果它在宽限轮里还想调工具，直接暂停，让用户下一条消息决定是否继续。
 			return fmt.Errorf("paused after %d tool-call rounds (%s) — the work so far is saved; send another message to continue, or set %s higher or to 0 for no limit", a.maxSteps, a.maxStepsKey, a.maxStepsKey)
 		}
 
+		// 执行模型请求的整批工具调用，并按原顺序拿到每个工具的结果文本。
 		results := a.executeBatch(ctx, calls)
 		for i, call := range calls {
+			// 每个工具结果都必须回写到 session，下一轮模型才能“看到自己刚刚调用工具得到了什么”。
 			a.session.Add(provider.Message{
 				Role:       provider.RoleTool,
 				Content:    results[i],
@@ -815,16 +912,22 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 		// If the context was cancelled during tool execution, return after storing
 		// the batch results so the session keeps paired tool-call history.
 		if ctx.Err() != nil {
+			// 这里先保存工具结果再退出，是为了保证会话历史完整：
+			// assistant 发起了哪些 tool call、tool 实际回了什么，必须成对存在。
 			return ctx.Err()
 		}
 
 		// The prompt only grows from here; compact before the next turn so it
 		// stays within the model's window.
+		// 工具结果写入后上下文只会越来越长，因此在下一轮前尝试压缩，
+		// 防止 prompt 超出模型上下文窗口。
 		a.maybeCompact(ctx, usage)
 
 		// When the tool-call budget runs out this round, give the model
 		// one grace round to produce a final answer from completed work.
 		if a.maxSteps > 0 && step+1 >= a.maxSteps {
+			// 达到工具调用轮次上限后，不是立刻硬退出，而是额外给模型一次“只准总结”的机会。
+			// 这样用户通常至少能收到一份阶段性结果，而不是生硬中断。
 			graceRound = true
 			nudge := fmt.Sprintf("Do not call any more tools — your tool-call round limit (%s) has been reached. Instead, synthesize a final answer from all the work already completed: summarize what was accomplished, what remains to be done, and any decisions the user should make. The user can increase %s or continue in the next turn if more work is needed.", a.maxStepsKey, a.maxStepsKey)
 			a.session.Add(provider.Message{Role: provider.RoleUser, Content: a.withReasoningLanguage(nudge)})
