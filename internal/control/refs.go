@@ -163,11 +163,29 @@ func (c *Controller) inputImages(line string) []string {
 	return urls
 }
 
+// visionRefImageDataURL converts an image-shaped @reference into a data URL for
+// multimodal input. It intentionally distinguishes two sources:
+//   - refImage: a managed attachment under .reasonix/attachments, which follows
+//     the attachment sandbox/path-validation rules;
+//   - refFile: a normal workspace file, which must stay inside workspaceRoot and
+//     follows the workspace file sandbox rules.
+//
+// 中文说明：
+// 这里必须区分 refImage 和 refFile，不是因为它们最后的结果不同，
+// 而是因为“读取图片时该遵守的安全边界不同”：
+// 1. refImage 表示聊天附件图片，路径根在 `.reasonix/attachments/`；
+// 2. refFile 表示工作区里的普通文件图片，路径根在 workspaceRoot。
+// 两者都会转成 data URL 发给 vision 模型，但前者走附件校验逻辑，
+// 后者走工作区校验逻辑，不能混用同一套路径解析规则。
 func visionRefImageDataURL(r ref, baseDir string) (string, error) {
 	switch r.kind {
 	case refImage:
+		// 附件图片：复用 attachment 读图/压缩逻辑，确保路径只能落在
+		// `.reasonix/attachments/` 下，且不能借 symlink 绕出附件目录。
 		return visionImageDataURL(r.path)
 	case refFile:
+		// 工作区图片：按 workspace root 解析和打开文件，确保引用不能越过
+		// 当前项目根目录；这和附件图片的安全边界是两套不同规则。
 		return visionFileImageDataURL(r.path, baseDir)
 	default:
 		return "", fmt.Errorf("reference is not an image")

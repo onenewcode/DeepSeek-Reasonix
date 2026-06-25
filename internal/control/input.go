@@ -143,6 +143,22 @@ var syntheticPrefixes = []string{
 // returning the message to actually send to the model. The frontend keeps
 // showing the raw text as the user bubble.
 func (c *Controller) Compose(text string) string {
+	// 中文说明：
+	// Compose 的职责不是“原样返回用户输入”，而是把本轮真正需要带给模型、
+	// 但又不应该直接显示成用户气泡的控制信息，按顺序拼接到用户文本前面。
+	//
+	// 为什么要进行拼接：
+	// 1. 这些信息是“只影响本轮执行”的运行时上下文，例如：
+	//    - 当前是否处于 plan mode；
+	//    - 当前 active goal 是什么；
+	//    - 刚发生的 memory 更新；
+	//    - 后台任务完成通知。
+	// 2. 这些内容如果写进 system prompt，会破坏缓存稳定前缀，增加 token 开销；
+	// 3. 这些内容如果完全不拼进本轮消息，模型就看不到，自然也无法据此调整行为；
+	// 4. 前端仍显示 raw text，避免把系统注入内容伪装成“用户亲手输入的话”。
+	//
+	// 所以这里采用的策略是：
+	// “UI 展示原始用户文本；真正发给模型的文本 = 控制块/提示块 + 用户文本”。
 	c.mu.Lock()
 	plan := c.planMode
 	reasoningLanguage := c.reasoningLanguage
@@ -151,17 +167,25 @@ func (c *Controller) Compose(text string) string {
 	goal, goalStatus, goalResearchMode := c.goals.snapshot()
 
 	if strings.TrimSpace(goal) != "" && goalStatus == GoalStatusRunning {
+		// active goal 要放在最前面，让模型先看到“当前正在持续推进的目标”，
+		// 再理解用户这次输入与长期目标之间的关系。
 		text = activeGoalBlock(goal, goalResearchMode) + "\n\n" + text
 	}
 	if plan {
+		// plan mode marker 也是前缀式拼接：它改变的是模型这一轮的行为边界，
+		// 例如偏向只读探索、先给计划而不是直接改文件。
 		text = PlanModeMarker + "\n\n" + text
 	}
+	// reasoning language 也是一种控制信息，但它被封装成独立 transient block，
+	// 这样模型能收到语言要求，而 UI 又可以继续显示用户原文。
 	text = agent.WithReasoningLanguage(text, reasoningLanguage)
 
 	// Memory added mid-session rides the turn (never the cached system prefix),
 	// so it takes effect now without invalidating the prompt cache. It folds into
 	// the system prefix on the next session, where it costs nothing per turn.
 	if len(notes) > 0 {
+		// memory 更新不是用户手输的正文，却必须让模型“立刻知道”；
+		// 因此把它作为 <memory-update> 块拼在本轮消息前面。
 		var b strings.Builder
 		b.WriteString("<memory-update>\n")
 		b.WriteString("The following project-memory changes were just made and apply from now on:\n")
@@ -177,6 +201,8 @@ func (c *Controller) Compose(text string) string {
 	// its context. Like memory, this never touches the cache-stable prefix.
 	if c.jobs != nil {
 		if note := c.jobs.DrainCompletedNoteForSession(c.parentSessionID()); note != "" {
+			// 后台任务完成信息同理：用户界面可能已经提示过，但模型上下文并不知道。
+			// 所以也要拼进本轮消息里，保证模型能基于最新执行状态继续工作。
 			text = "<background-jobs>\n" + note + "\n</background-jobs>\n\n" + text
 		}
 	}
