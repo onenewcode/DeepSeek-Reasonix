@@ -112,6 +112,9 @@ func NewSubagentStore(dir string) *SubagentStore {
 	if strings.TrimSpace(dir) == "" {
 		return nil
 	}
+	// 所有可继续的 subagent 上下文都集中落在 <sessionDir>/subagents 下面：
+	// - sa_xxx.jsonl      保存子会话 Messages
+	// - sa_xxx.meta.json  保存归属、工具范围、模型、persona hash 等校验信息
 	return &SubagentStore{dir: dir, locked: map[string]bool{}}
 }
 
@@ -246,6 +249,7 @@ func (s *SubagentStore) PrepareFresh(spec SubagentSpec) (*SubagentRun, error) {
 	}
 	now := time.Now().UTC()
 	meta := metaFromSpec(ref, SubagentRunning, now, now, spec)
+	// fresh subagent 从独立 Session 起步；它的 system prompt 只进子会话，不回写父会话。
 	return &SubagentRun{Ref: ref, Session: NewSession(spec.SystemPrompt), Meta: meta, store: s, release: release}, nil
 }
 
@@ -288,6 +292,8 @@ func (s *SubagentStore) PrepareContinue(ref string, spec SubagentSpec) (*Subagen
 	}
 	meta.ParentSession = spec.ParentSession
 	meta.ParentToolCallID = spec.ParentToolCallID
+	// continue_from 的核心就是把旧的子会话 JSONL 重新读回 Session，再继续追加。
+	// 这里不会把 transcript 展平成父 prompt，也不会把子消息拷进父 Session。
 	return &SubagentRun{Ref: ref, Session: sess, Meta: meta, store: s, release: release}, nil
 }
 
@@ -501,6 +507,8 @@ func (s *SubagentStore) prepareFork(ref string, spec SubagentSpec) (*SubagentRun
 	now := time.Now().UTC()
 	newMeta := metaFromSpec(newRef, SubagentRunning, now, now, spec)
 	newMeta.ForkedFrom = sourceRef
+	// 跨父会话分支继续时，不直接改写祖先 transcript，而是复制一份新的子 transcript
+	// 归当前父会话所有，后续 continue_from 都沿这份副本前进。
 	return &SubagentRun{Ref: newRef, Session: sess, Meta: newMeta, ForkedFrom: sourceRef, store: s, release: newRelease}, nil
 }
 
@@ -524,6 +532,8 @@ func (s *SubagentStore) SaveCompleted(run *SubagentRun) error {
 	if s.parentDestroyed(run) {
 		return nil
 	}
+	// 完成态先落子会话 JSONL，再落 meta。这样下次 continue_from 能先恢复完整上下文，
+	// 再用 meta 校验“是不是同一个 subagent 身份”。
 	if err := run.Session.Save(s.sessionPath(run.Ref)); err != nil {
 		return err
 	}
@@ -598,6 +608,9 @@ func validateMeta(meta SubagentMeta, spec SubagentSpec) error {
 		return fmt.Errorf("subagent reference %q was interrupted by a previous shutdown or crash and cannot be continued or forked; run a fresh subagent instead", meta.Ref)
 	}
 	want := metaFromSpec(meta.Ref, meta.Status, meta.CreatedAt, meta.UpdatedAt, spec)
+	// 这里校验的是“恢复后的 subagent 身份是否还是同一个”：
+	// persona、工具范围、tool schema、模型、workspace 任一项变化，都会拒绝继续，
+	// 避免把旧上下文错误地接到一条新能力边界上。
 	switch {
 	case meta.Kind != want.Kind:
 		return fmt.Errorf("subagent reference %q has kind %q, want %q", meta.Ref, meta.Kind, want.Kind)

@@ -68,6 +68,10 @@ func (m *memoryManager) drainPending() []string {
 // the start of the writeMu-serialized write and supplies the discovery roots.
 // Callers hold writeMu.
 func (m *memoryManager) applyWrite(mem *memory.Set, note string) {
+	// 同一条记忆写入会分两步生效：
+	// 1. 先从磁盘重新发现，刷新内存面板/管理视图读到的 snapshot；
+	// 2. 再把 note 排进 pending，等下一次 Compose 时拼到会话尾部。
+	// 这样既能“本 session 立刻知道有了新记忆”，又不需要重写 cache-stable prefix。
 	reloaded := memory.Load(memory.Options{CWD: mem.CWD, UserDir: mem.UserDir})
 	m.mu.Lock()
 	if note != "" {
@@ -163,6 +167,9 @@ func (m *memoryManager) forget(name string) error {
 // enabled, and still queues the turn-tail note when it isn't (there's no snapshot
 // to re-discover).
 func (m *memoryManager) queue(note string) {
+	// 这是模型侧 remember/forget 的“立即生效但不改前缀”通道。
+	// 记忆已经先落盘了；queue 做的是把“刚刚保存/归档了什么”补给当前 session，
+	// 避免模型直到下次重启会话才看见这次记忆变化。
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()
 	if mem := m.current(); mem != nil {

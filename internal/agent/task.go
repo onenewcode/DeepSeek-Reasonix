@@ -406,6 +406,10 @@ func (t *TaskTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	subReg := t.buildSubReg(p.Tools)
 	modelRef, effortRef := t.effectiveProfile(p.Model, p.Effort)
 	parentID, parent, _, _ := CallContext(ctx)
+	// subagent 不会继承父 Agent 的整段对话历史；这里只继承三类运行时边界：
+	// 1. 允许使用的工具集合 subReg；
+	// 2. 持久化归属信息 ParentSession(ctx)；
+	// 3. 当前父工具调用 ID，用来把子工具事件回挂到父事件流里。
 	run, err := t.prepareTranscriptRun(subReg, modelRef, effortRef, ParentSession(ctx), parentID, p.ContinueFrom, p.ForkFrom)
 	if err != nil {
 		return "", err
@@ -428,6 +432,9 @@ func (t *TaskTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 			}
 			return "", fmt.Errorf("background execution is not available in this context")
 		}
+		// 后台 subagent 跑起来后，原始 ctx 可能已经结束，所以这里先把父 sink 和
+		// parentID 固化下来。这样即使真正执行发生在 job goroutine 里，前端仍能把
+		// 子工具事件显示在这次 task 调用下面。
 		nested := subSinkFor(parentID, parent)
 		label := p.Description
 		if label == "" {
@@ -496,6 +503,8 @@ func (t *TaskTool) prepareTranscriptRun(subReg *tool.Registry, modelRef, effortR
 		if continueFrom != "" || legacyForkFrom != "" {
 			return nil, fmt.Errorf("subagent continuation requires a persisted session; none is active in this run")
 		}
+		// 没有父会话时，subagent 仍然会有独立 Session，但只活在内存里：
+		// 不生成 sa_* 引用，不落盘，也不能 continue_from。
 		return EphemeralSubagentRun(t.sysPrompt), nil
 	}
 	identityModel, identityEffort := t.effectiveIdentity(modelRef, effortRef)
@@ -511,6 +520,8 @@ func (t *TaskTool) prepareTranscriptRun(subReg *tool.Registry, modelRef, effortR
 		Effort:           identityEffort,
 	}
 	if continueFrom != "" {
+		// continue_from 不是把旧 transcript 文本直接塞回父 prompt，而是让 store
+		// 把对应子会话 JSONL 重新加载成 Session，随后继续在那份子上下文上追加。
 		return t.transcripts.PrepareContinue(continueFrom, spec)
 	}
 	if legacyForkFrom != "" {
@@ -678,6 +689,8 @@ func (t *TaskTool) resolveSubSessionRuntime(modelRef, effort string) (provider.P
 }
 
 func (t *TaskTool) runSubSession(ctx context.Context, prompt string, subReg *tool.Registry, sink event.Sink, maxSteps int, prov provider.Provider, pricing *provider.Pricing, ctxWin int, sess *Session) (string, error) {
+	// 子上下文真正存放在 sess.Messages 里。这个 Session 与父 Agent 的 Session 分离：
+	// 父会话只会拿到最终 answer（以及可选的 sa_* 引用），不会混入子会话的中间消息。
 	return RunSubAgentWithSession(ctx, prov, subReg, sess, prompt, Options{
 		MaxSteps:          maxSteps,
 		Temperature:       t.temperature,
@@ -714,6 +727,7 @@ func FormatSubagentReference(run *SubagentRun) string {
 
 func FormatSubagentRunResult(answer string, run *SubagentRun, failed bool) string {
 	if run == nil || run.Ref == "" {
+		// ephemeral subagent 只把最终答案回传给父 Agent；没有可继续的持久化引用。
 		return answer
 	}
 	if failed {
@@ -732,6 +746,11 @@ func RunSubAgentWithSession(ctx context.Context, prov provider.Provider, reg *to
 	if sess == nil {
 		return "", fmt.Errorf("sub-agent session is nil")
 	}
+	// 这里是 subagent 调用链的真正执行点：
+	// 1. 用独立的 Session 构造一个新的 Agent；
+	// 2. 把父工具传下来的 prompt 作为这轮子会话的 user 输入；
+	// 3. 子 Agent 自己跑完整轮；
+	// 4. 结束后只把最后一条 assistant 文本作为结果回给父 Agent。
 	sub := New(prov, reg, sess, opts, sink)
 	if err := sub.Run(ctx, prompt); err != nil {
 		return "", fmt.Errorf("sub-agent: %w", err)
@@ -794,6 +813,9 @@ func subSinkFor(parentID string, parent event.Sink) event.Sink {
 	return event.FuncSink(func(e event.Event) {
 		switch e.Kind {
 		case event.ToolDispatch, event.ToolResult:
+			// 主从 Agent 的沟通不是“把子消息追加进父 Session”，而是把可视化事件
+			// 重新打上父调用 ID 再转发给前端。这样用户能看到子工具过程，但父模型上下文
+			// 仍只吸收最终 tool result。
 			e.Tool.ParentID = parentID
 			e.Tool.ID = parentID + "/" + e.Tool.ID
 			parent.Emit(e)

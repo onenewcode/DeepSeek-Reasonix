@@ -20,8 +20,17 @@ func newTurnOrchestrator(c *Controller) *turnOrchestrator {
 func (o *turnOrchestrator) runTurnWithRawDisplay(ctx context.Context, input, raw, display string) error {
 	c := o.c
 	c.maybeSessionStart(ctx)
+	// plan 模式的主调用链从这一层开始串起来：
+	// 1. 先基于 raw 输入决定是否自动进入 plan mode；
+	// 2. 再把 plan marker / goal / memory note 等运行时块拼进实际发给模型的 input；
+	// 3. 调 runner.Run 执行这一轮；
+	// 4. 若本轮结束后仍处于 plan mode，再进入“计划审批 -> 退出 plan mode -> 执行回合”。
 	c.maybeAutoPlan(ctx, raw)
 	parentSession := c.parentSessionID()
+	// subagent 的“归属会话”就是从这里注入到整轮上下文里的：
+	// 后面主 Agent 执行 task/run_skill 时，会从 ctx 里取出这个 parentSession，
+	// 用它决定子会话是否允许持久化、子 transcript 写到哪个父会话名下，
+	// 以及 continue_from 是否属于当前会话分支。
 	ctx = agent.WithParentSession(ctx, parentSession)
 	ctx = jobs.WithSession(ctx, parentSession)
 	ctx = agent.WithUserImages(ctx, c.inputImages(input))
@@ -59,6 +68,8 @@ func (o *turnOrchestrator) runTurnWithRawDisplay(ctx context.Context, input, raw
 	if proposal == "" {
 		return nil // no substantive proposal to gate
 	}
+	// 走到这里说明本轮已经在 plan mode 下产出了一个计划文本；后续是否退出
+	// plan mode 进入执行，不再交给模型自己决定，而是切到控制器的审批链路。
 	// The plan is already visible as the assistant's answer, so the request
 	// carries no subject — it's purely the gate.
 	allow, _, err := c.requestApproval(ctx, planApprovalTool, "", nil)

@@ -39,6 +39,9 @@ func normalizeAutoPlan(mode string) string {
 
 func (c *Controller) maybeAutoPlan(ctx context.Context, input string) {
 	if c.shouldAutoPlan(ctx, input) {
+		// auto-plan 只负责把本轮后续链路切到 plan mode；
+		// 真正的行为变化要等 Compose 注入 marker、以及 executor 在工具执行处
+		// 打开 planmode.Policy 闸门之后才完整生效。
 		c.SetPlanMode(true)
 		c.notice("auto plan: task looks multi-step; drafting a plan first")
 	}

@@ -72,6 +72,10 @@ type callContext struct {
 // the asker. executeOne sets this before every Execute; `task` reads it (via
 // CallContext) to nest sub-agent events, and `ask` reads the asker to prompt.
 func withCallContext(ctx context.Context, parentID string, sink event.Sink, asker Asker, planMode bool) context.Context {
+	// 这里不传父会话全文上下文，只传“当前工具调用的最小通信信道”：
+	// 1. parentID：让 subagent 的工具事件能挂回父工具调用下面；
+	// 2. sink：把子工具 dispatch/result 转发给前端；
+	// 3. asker：只有 ask 这类需要用户交互的工具才读它。
 	return context.WithValue(ctx, callContextKey{}, callContext{parentID: parentID, sink: sink, asker: asker, planMode: planMode})
 }
 
@@ -97,6 +101,8 @@ func PlanModeFromContext(ctx context.Context) bool {
 // WithParentSession stamps the active parent session ID onto a turn context so
 // persisted sub-agents can record and enforce their owning conversation.
 func WithParentSession(ctx context.Context, parentSession string) context.Context {
+	// 这个值不是给模型看的 prompt，而是给框架自己做 transcript 归属校验用的：
+	// subagent store 会据此决定能否持久化、能否 continue、是否需要从祖先分支 fork 一份副本。
 	return context.WithValue(ctx, parentSessionContextKey{}, strings.TrimSpace(parentSession))
 }
 
@@ -1420,7 +1426,7 @@ func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, [
 		a.sink.Emit(event.Event{Kind: event.Retrying, RetryAttempt: info.Attempt, RetryMax: info.Max})
 	})
 	ch, err := a.prov.Stream(ctx, provider.Request{
-		Messages:    a.session.Messages,
+		Messages: a.session.Messages,
 		// 当前会话里已经注入到 registry 的全部工具，会在这里导出成 schema，
 		// 并随 provider.Request 一起发给模型。
 		Tools:       a.tools.Schemas(),
@@ -1876,6 +1882,10 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 		}
 	}
 	if a.planMode.Load() {
+		// 这里是 plan mode 在执行期真正生效的地方：
+		// Controller 前面通过 SetPlanMode + Compose 把“当前在规划”这个状态一路传到
+		// Agent；到了 executeOne，才会把工具的 ReadOnly、自报的
+		// PlanModeSafe/Unsafe 以及 MCP 只读提示的可信度一起交给策略层裁决。
 		// Translate the tool's optional plan-mode self-report into the policy's
 		// tri-state. Mirrors the t.(tool.Previewer) assertion precedent below.
 		safety := planmode.PlanSafetyUnknown
@@ -1942,6 +1952,9 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 			}
 		}
 	}
+	// 主 Agent 与 subagent/ask 等工具的“运行时沟通”在这里接通：
+	// executeOne 为本次工具调用打上 callContext，后续 task/run_skill 读取它后，
+	// 不共享父会话 message log，而是通过 parentID+sink 把子工具事件回传给前端。
 	cctx := withCallContext(ctx, call.ID, a.sink, a.asker, a.planMode.Load())
 	if a.evidence != nil {
 		cctx = evidence.WithLedger(cctx, a.evidence)

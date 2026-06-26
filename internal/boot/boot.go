@@ -260,6 +260,18 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	allSkillStore := skill.New(skill.Options{ProjectRoot: root, CustomPaths: cfg.SkillCustomPaths(), ExcludedPaths: cfg.SkillExcludedPaths(), MaxDepth: cfg.SkillMaxDepth(), Stderr: io.Discard})
 	allSkills := allSkillStore.List()
 	if !tokenEconomy {
+		// Full mode 在启动时就完成 skill 的“首次披露”：skill.ApplyIndex
+		// 只把 names/descriptions 塞进 cache-stable system prompt。
+		// token economy mode 则故意跳过这里，等模型显式调用
+		// connect_tool_source("skills") / ("read_only_skill") 时，再把同样的
+		// index 作为 tool result 注入，避免默认 prompt 预载整个 skills surface。
+		// 这也是 prompt cache 一致性的关键：稳定前缀里只放低频、确定、短小的 skill
+		// index；真正会随任务变化的 skill body 和按需启用动作，都留在 turn-time
+		// tool result / tool registry 里处理，不在每轮重写 system prompt。
+		// 注意 tool schema 本身也会传给模型；因此若后续显式启用新的 skill source，
+		// 下一次请求的 provider-visible tools 集合仍会变化。但至少 skill 正文不会
+		// 随每次调用都挤进稳定前缀，缓存抖动被限制在“启用 source 的那一次”，
+		// 而不是每次运行 skill 都重写前缀。
 		sysPrompt = skill.ApplyIndex(sysPrompt, skills)
 	}
 
@@ -380,11 +392,11 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 						// HasClient and Add, or is currently spawning it.
 						// Fetch tools from the existing client, or wait briefly.
 						tools, err2 := pluginHost.ToolsFor(ctx, s.Name)
-					if err2 == nil {
-						for _, t := range tools {
-							reg.Add(t)
-						}
-						continue
+						if err2 == nil {
+							for _, t := range tools {
+								reg.Add(t)
+							}
+							continue
 						}
 					}
 					sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn,
@@ -556,6 +568,10 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	readOnlyTaskToolAdded := false
 	var taskTool *agent.TaskTool
 	newTaskTool := func() *agent.TaskTool {
+		// 主 Agent 的 subagent 能力在这里装配完成：
+		// - reg 决定子 Agent 可继承哪些工具
+		// - headlessGate 决定子 Agent 没有交互式审批，只能自动 allow/deny
+		// - WithTranscripts 把可持久化的 subagent store 接进来
 		return agent.NewTaskTool(execProv, entry.Price, reg, maxSteps,
 			entry.ContextWindow, cfg.Agent.RecentKeep, cfg.Agent.SoftCompactRatio, cfg.Agent.CompactRatio, cfg.Agent.CompactForceRatio,
 			cfg.Agent.Temperature, config.ArchiveDir(), "", headlessGate,
@@ -644,6 +660,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 				steps = 5
 			}
 		}
+		// read_only_skill 的 skill body 只进入子 Session 的 system prompt。
+		// 父 Agent 不保存这份正文；它只收到最终 tool result。
 		sysPrompt := agent.DefaultReadOnlyTaskSystemPrompt + "\n\nSkill instructions:\n" + sk.Body
 		return agent.RunSubAgentWithSession(sctx, prov, subReg, agent.NewSession(sysPrompt), task, agent.Options{
 			MaxSteps:          steps,
@@ -695,6 +713,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			if continueFrom != "" || legacyForkFrom != "" {
 				return "", fmt.Errorf("subagent continuation requires a persisted session; none is active in this run")
 			}
+			// 无父会话时，skill subagent 退化为纯内存子会话：能跑，但没有 sa_* 引用。
 			run = agent.EphemeralSubagentRun(sk.Body)
 		} else {
 			identityModel, identityEffort := subagentIdentity(modelRef, effortRef)
@@ -709,6 +728,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 				Model:            identityModel,
 				Effort:           identityEffort,
 			}
+			// 这里把“这个 skill subagent 是谁”固化成 spec，随后交给 store 做：
+			// 新建 / 继续 / 祖先分支复制，以及 persona+工具边界一致性校验。
 			var prepErr error
 			if continueFrom != "" {
 				run, prepErr = subagentStore.PrepareContinue(continueFrom, spec)
@@ -843,8 +864,17 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		}
 		skillToolsAdded = true
 		addReadOnlySkillTools()
-		// 这里把 skill 相关工具注入 reg。模型不会直接拿到 skill body，
-		// 而是先看到这些 tool，再通过 run_skill/read_skill 等按需加载 skill。
+		// 这里把 skill 相关工具注入 reg。渐进披露完成后，新增能力不是写回
+		// sysPrompt，而是挂到当前会话的 tool registry：下一次模型请求开始，
+		// run_skill/read_skill/install_skill 和内建 skill wrappers 才真正可见。
+		// skill body 仍不会在这里预加载；它们继续通过 run_skill/read_skill 按需展开。
+		// 这里要区分两层：
+		// 1. 会改变：下一次 provider.Request 里的 tool schemas，会让 provider
+		//    可见的前缀形状发生一次变化；
+		// 2. 不会改变：不会把具体 skill body 直接写进 system prompt，也不会让
+		//    每次 skill 调用都把长正文灌进稳定前缀。
+		// 所以 source 开启确实会影响缓存形状，但影响点是“工具集合变了”这一跳，
+		// 不是“每次运行 skill 都重写整段稳定前缀”。
 		reg.Add(skill.NewRunSkillTool(skillStore, skillRunner, skillProfile))
 		reg.Add(skill.NewReadSkillTool(skillStore))
 		reg.Add(skill.NewInstallSkillTool(skillStore, nil))
@@ -1228,6 +1258,9 @@ func newSubagentStore(sessionDir string) (*agent.SubagentStore, error) {
 		return nil, nil
 	}
 	store := agent.NewSubagentStore(filepath.Join(sessionDir, "subagents"))
+	// 启动时不会预加载所有 subagent transcript 到内存；这里只做一次“扫尾”：
+	// 若上次进程异常退出，仍标记为 running 的引用会改成 interrupted。
+	// 真正的上下文恢复发生在某次 continue_from 命中具体 sa_* 时按需 LoadSession。
 	if _, err := store.CleanupStaleRunning(); err != nil {
 		return nil, fmt.Errorf("cleanup stale subagents: %w", err)
 	}

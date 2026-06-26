@@ -26,6 +26,11 @@ type PruneStats struct {
 // PruneStaleToolResults elides tool-result content older than the protected
 // recent tail, archiving the originals first. Idempotent; a no-op when
 // compaction is disabled (no context window).
+//
+// 这样做可以在不改动 cache-stable system prefix 的前提下回收上下文，但代价是
+// 较老的 inline skill body 不是永久保留对象：一旦它们离开受保护的 recent
+// tail，就可能像其他大 tool result 一样被归档后替换成占位标记。这里追求的
+// 约束是“可恢复、可续跑”（archive / summary / re-run），而不是“逐字永久保留”。
 func (a *Agent) PruneStaleToolResults() (PruneStats, error) {
 	var st PruneStats
 	if a.contextWindow <= 0 {

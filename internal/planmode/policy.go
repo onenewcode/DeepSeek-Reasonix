@@ -148,6 +148,9 @@ var goWriteOrExecArgs = map[string]bool{
 // PlanSafe ⇒ ReadOnly is enforced: a writer that claims plan-safe is a wiring
 // bug and is refused.
 func (p Policy) Decide(call Call) Decision {
+	// 这里只回答一个问题：既然当前已经在 plan mode，这次工具调用是否允许通过。
+	// “何时进入 plan mode” 由上游控制器决定；调用链是：
+	// maybeAutoPlan / SetPlanMode -> Agent.executeOne -> planModeBlocked -> Decide。
 	name := strings.TrimSpace(call.Name)
 	if name == "bash" {
 		return decideBash(call.Args)

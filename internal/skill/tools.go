@@ -104,6 +104,9 @@ func (t *runSkillTool) Execute(ctx context.Context, args json.RawMessage) (strin
 		if rawArgs == "" {
 			return "", fmt.Errorf("run_skill: skill %q is a subagent and requires 'arguments' — the subagent has no other context, so describe the concrete task", name)
 		}
+		// subagent skill 的最终落点不是父会话 prompt，而是子会话的 system prompt：
+		// boot 里的 runner 会把 sk.Body 交给 RunSubAgentWithSession。父会话只收到
+		// 最终答案/引用，不直接承载整段 skill body。
 		return t.runner(ctx, sk, rawArgs, opts)
 	}
 	if opts.ContinueFrom != "" || opts.ForkFrom != "" {
@@ -561,6 +564,11 @@ func Render(sk Skill, args string) string {
 func renderInline(sk Skill, args string) string {
 	// skill body 在这里被包成当前轮的工具结果文本，
 	// 这是 inline skill 进入主会话上下文的最终落点。
+	// 后续模型请求看到的是这段 tool result，而不是 boot 阶段预先展开的 body。
+	// skill-pin 还会提示 compaction 层尽量原样保留这段披露后的内容。
+	// 但它不是 system-prompt 级别的永久 pin：一旦消息足够老，仍可能被摘要或
+	// prune。这样换来的是 prompt cache 稳定；如果某个技能必须长期严格保真，
+	// 应优先让它留在稳定前缀里，或改成 subagent skill 让 body 驻留在子会话。
 	return "<skill-pin name=" + strconv.Quote(sk.Name) + ">\n" + Render(sk, args) + "\n</skill-pin>"
 }
 

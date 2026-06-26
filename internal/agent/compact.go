@@ -436,6 +436,13 @@ func (a *Agent) pinnableUserTurn(m provider.Message) bool {
 // turns (a fact the user stated is never summarized away) and prior digests (so a
 // later fold never re-summarizes an earlier digest and drops the facts it already
 // captured) — and the rest, which folds. Order within each group is preserved.
+//
+// inline skill 的正文在 tool result 里，不在 cache-stable prefix 里，
+// 所以 compaction 对它的保护是“间接保护”而不是“永久硬钉住”：
+// - 新近的 skill 披露结果通常会留在 recent tail；
+// - 需要保留的 assistant/tool 成组消息可以一起留下；
+// - 更老的内容会先归档，再被摘要或 prune。
+// 也就是说这里保证的是任务连续性和可恢复性，而不是“这段旧 skill body 永远逐字保留”。
 func (a *Agent) partitionFold(region []provider.Message) (kept, fold []provider.Message) {
 	policyKeep := keepIndexes(region, a.keepPolicy)
 	for i, m := range region {
@@ -589,7 +596,11 @@ func (a *Agent) tailFloor() int {
 // message would push its token estimate past budgetTokens (but never below
 // minKeep messages), then aligns the boundary back off any tool result so the
 // tail never begins with an orphan whose assistant tool_calls were summarized
-// away.
+// away。
+//
+// 这是对“最近刚披露的 inline skill”最直接的保护点——
+// skill tool call 和返回的 body 会尽量一起留在 recent tail 中，而不是被切成
+// “前半进摘要、后半留原文”的断裂状态。
 func tailStart(msgs []provider.Message, head, budgetTokens int, tokPerChar float64, minKeep int) int {
 	start := len(msgs)
 	acc := 0

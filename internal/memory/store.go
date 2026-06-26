@@ -180,6 +180,12 @@ func (s Store) Path(name string) string {
 // editor, and any future importer all go through here so the index never drifts
 // from the files. Returns the path written.
 func (s Store) Save(m Memory) (string, error) {
+	// 这里不再做“该不该记住”的策略判断，只负责持久化执行：
+	// 调用方（remember 工具、面板保存、未来导入器）已经先决定了“现在就保存”。
+	// Store.Save 的职责是把这次决定原子地写成：
+	// 1. <name>.md 事实文件；
+	// 2. MEMORY.md 索引行；
+	// 3. 需要时清掉另一目录里的同名活动副本，避免 global/project 重复。
 	dir := s.DirFor(m.Type)
 	if dir == "" {
 		return "", fmt.Errorf("memory store unavailable (no user config dir)")
@@ -267,6 +273,8 @@ func removeActiveMemoryInDir(dir, name string) error {
 // traceable. A missing file is not an error; the goal state (gone) holds either
 // way.
 func (s Store) Delete(name string) error {
+	// “忘记”也是显式时机触发：只有 forget / 面板删除这类入口真的调用到这里，
+	// 才会把活动记忆移出索引并归档。系统不会因为旧了、久了或命中率低就自动删。
 	_, err := s.Archive(name)
 	return err
 }

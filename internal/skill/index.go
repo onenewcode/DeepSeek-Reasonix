@@ -50,6 +50,11 @@ func indexBlockWithHeader(header string, skills []Skill) string {
 // ApplyIndex appends the skills index to basePrompt, or returns it unchanged
 // when there are no skills. Only names + descriptions (+ a subagent tag) are
 // listed; bodies load on demand via run_skill.
+//
+// 这里是 eager disclosure 路径。full mode 下 boot 会把这里返回的 skills
+// index 直接写进会话的 cache-stable system prompt；token economy mode
+// 则跳过 ApplyIndex，改为稍后通过 connect_tool_source 暴露同一份
+// IndexBlock，让披露结果落在 tool result 而不是稳定前缀里。
 func ApplyIndex(basePrompt string, skills []Skill) string {
 	block := IndexBlock(skills)
 	if block == "" {

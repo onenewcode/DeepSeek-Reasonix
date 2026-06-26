@@ -470,6 +470,10 @@ const planApprovedMessage = "Plan approved — plan mode is off; you’re cleare
 // next turn can revise. Plan mode is only ever set interactively, so the headless
 // `Run` path (which doesn't call this) never blocks on a prompt.
 func (c *Controller) runTurn(ctx context.Context, input string) error {
+	// 这是交互式 plan 模式的统一入口壳：
+	// submit/runRefTurn/HTTP/ACP 最终都会汇到 runGoalLoopWithRawDisplay，
+	// 再进入 turnOrchestrator.runTurnWithRawDisplay 完成 auto-plan、Compose、
+	// 模型执行与计划审批的完整链路。
 	return c.runGoalLoopWithRaw(ctx, input, input)
 }
 
@@ -1321,6 +1325,9 @@ func (c *Controller) SetPlanMode(v bool) {
 	c.mu.Lock()
 	c.planMode = v
 	c.mu.Unlock()
+	// plan mode 的状态要同时传播给：
+	// 1. Controller 自己：供 Compose 决定是否给后续用户消息加 PlanModeMarker；
+	// 2. executor / runner：供 executeOne 在真正跑工具前执行只读闸门。
 	if c.executor != nil {
 		c.executor.SetPlanMode(v)
 	}

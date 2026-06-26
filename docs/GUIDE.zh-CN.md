@@ -16,6 +16,7 @@
 - [配置路径](./CONFIG_PATHS.zh-CN.md)
 - [思考语言](./REASONING_LANGUAGE.zh-CN.md)
 - [桌面端 Hooks](./DESKTOP_HOOKS.zh-CN.md)
+- [Subagent 调用链](./SUBAGENT_CALL_CHAIN.zh-CN.md)
 - [快捷键](#快捷键)
 - [权限与沙盒](#权限与沙盒)
 - [插件（MCP）](#插件mcp)
@@ -349,7 +350,7 @@ CLI 可以在本地轮次使用 Memory v5，但不会运行桌面端的聚合指
 `reasonix run --metrics <path>` 时，JSON 还会输出内容无关的 `memory_compiler_*` 汇总字段，
 以及 `memory_compiler_turn_details` 逐轮明细数组，包含是否注入、编译后 token 和 IR overhead
 估算、引用记忆/constraint/risk/step 数量，以及当前记忆图计数。
-技术实现细节见 [`SESSION_MEMORY_RETRIEVAL.md`](SESSION_MEMORY_RETRIEVAL.md)。
+技术实现细节见 [`SESSION_MEMORY_RETRIEVAL.zh-CN.md`](SESSION_MEMORY_RETRIEVAL.zh-CN.md)。
 
 ```markdown
 ---
@@ -436,7 +437,10 @@ source 仍会启用可写 skill 工具，plan mode 下继续阻断。
 `reasonix config auto-plan off|on`。Auto-plan 只认用户级设置；项目
 `reasonix.toml` 里的 `agent.auto_plan` 会被忽略。可见思考语言也采用类似形态：
 会话里用 `/reasoning-language auto|zh|en`，shell/脚本里用
-`reasonix config reasoning-language auto|zh|en`。Memory v5 使用 `/memory-v5 off|on|status`
+`reasonix config reasoning-language auto|zh|en`。如果你想追 plan 模式从输入、
+Compose、执行闸门到计划审批的完整调用链，见
+[`PLAN_MODE_CALL_CHAIN.zh-CN.md`](PLAN_MODE_CALL_CHAIN.zh-CN.md)。
+Memory v5 使用 `/memory-v5 off|on|status`
 或 `reasonix config memory-v5 off|on|status`，并且只认用户级设置。只有明确想为
 reasoning-language 写项目级覆盖时，才给 shell 命令加 `--local`。
 

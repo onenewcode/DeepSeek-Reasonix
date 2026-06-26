@@ -62,6 +62,11 @@ func (t rememberTool) Execute(ctx context.Context, args json.RawMessage) (string
 	if in.Description == "" || in.Body == "" {
 		return "", fmt.Errorf("description and body are required")
 	}
+	// 持久化时机不是后台自动判断的，而是“显式触发”：
+	// - 模型主动调用 remember；
+	// - 控制器的审批闸门放行这次记忆写入；
+	// - 然后才真正落盘到 Store.Save。
+	// 也就是说，这里执行到 Save 时，已经代表“本轮决定要把这条事实跨会话保存”。
 	name := in.Name
 	if name == "" {
 		name = in.Title // Save slugifies; the title (or, below, the description) makes a serviceable slug
@@ -80,6 +85,8 @@ func (t rememberTool) Execute(ctx context.Context, args json.RawMessage) (string
 		return "", err
 	}
 	if q, ok := QueueFromContext(ctx); ok {
+		// 落盘之后再补一条 turn-tail note，让这次会话立刻感知到新记忆；
+		// 真正的稳定前缀仍要等下次 session 启动时重新 Load/Compose。
 		q.QueueMemory("Saved memory \"" + slug(name) + "\": " + oneLine(in.Description))
 	}
 	return fmt.Sprintf("Saved memory to %s (it applies now and loads automatically in future sessions).", path), nil

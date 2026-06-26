@@ -270,6 +270,10 @@ func normalizeToolApprovalMode(mode string) string {
 }
 
 func requiresFreshApprovalTool(tool string) bool {
+	// 这些工具的时机判断属于“用户拥有的决定”，不是普通的工具权限缓存：
+	// 每次 remember/forget 都要重新问，因为“这条事实是否值得跨会话保存/删除”
+	// 本身就是一次新的持久化决策，不能被 session grant、persist rule 或
+	// YOLO/auto posture 复用。
 	switch tool {
 	case planApprovalTool, memoryRememberTool, memoryForgetTool:
 		return true

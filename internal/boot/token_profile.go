@@ -118,6 +118,10 @@ func (t *toolSourceConnector) Execute(ctx context.Context, args json.RawMessage)
 	}
 	name := strings.TrimSpace(p.Name)
 
+	// connect_tool_source 是 token economy 下的渐进披露闸门：
+	// 它只按需打开某个 source，并返回一段说明/索引给模型；不会在这里把
+	// SKILL.md body 批量塞进 prompt。真正的 skill body 仍要等后续
+	// read_skill / run_skill / read_only_skill 调用时再读取。
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
