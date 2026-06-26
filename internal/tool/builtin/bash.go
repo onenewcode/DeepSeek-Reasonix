@@ -141,7 +141,9 @@ func (b bash) Execute(ctx context.Context, args json.RawMessage) (string, error)
 			"conditional chaining, or issue the commands as separate calls")
 	}
 
-	// Wrap in the OS sandbox when configured; otherwise argv is just the shell.
+	// 权限闸门先决定这条 bash 调用能不能执行；这里再进入强制执行层，
+	// 把 shell 包进操作系统沙箱里。这样即使命令已经获准执行，也不能写出
+	// `WriteRoots` 之外，并且还可能被禁止访问网络。
 	argv, _ := sandbox.Command(b.sb, sh, p.Command)
 	cmdEnv := bashCommandEnv(ctx)
 

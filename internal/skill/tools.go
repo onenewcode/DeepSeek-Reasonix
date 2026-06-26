@@ -109,6 +109,8 @@ func (t *runSkillTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	if opts.ContinueFrom != "" || opts.ForkFrom != "" {
 		return "", fmt.Errorf("run_skill: subagent continuation is only valid for runAs=subagent skills")
 	}
+	// inline skill 的注入点：这里不新起子 Agent，而是把 skill body 包成 tool result
+	// 回灌到当前上下文，让主 Agent 在下一步直接读取并遵循它。
 	return renderInline(sk, rawArgs), nil
 }
 
@@ -557,6 +559,8 @@ func Render(sk Skill, args string) string {
 // renderInline wraps Render's output in a skill-pin sentinel so context
 // compaction preserves the body verbatim instead of paraphrasing it.
 func renderInline(sk Skill, args string) string {
+	// skill body 在这里被包成当前轮的工具结果文本，
+	// 这是 inline skill 进入主会话上下文的最终落点。
 	return "<skill-pin name=" + strconv.Quote(sk.Name) + ">\n" + Render(sk, args) + "\n</skill-pin>"
 }
 

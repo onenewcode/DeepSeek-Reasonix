@@ -246,6 +246,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	// one-liner index into the same cache-stable prefix — names + descriptions
 	// only; bodies load on demand via run_skill or "/<name>". Bodies never enter
 	// the prefix, so the index costs a fixed, small amount per turn.
+	// 这里是 skill 注入的第一层——先扫描并装载 skill 列表，
+	// 再把“名称 + 描述”的索引拼进主 Agent 的 system prompt。
 	skillStore := skill.New(skill.Options{
 		ProjectRoot:   root,
 		CustomPaths:   cfg.SkillCustomPaths(),
@@ -261,7 +263,15 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		sysPrompt = skill.ApplyIndex(sysPrompt, skills)
 	}
 
+	// 从这里开始构建本次会话的 tool registry；后面的 reg.Add(...)
+	// 就是把 tool 真正注入给当前 Agent 的动作。
 	reg := tool.NewRegistry()
+	// `bashSpec` 是 `bash` 工具的操作系统级隔离配置：
+	// - `Mode` 决定是否真的把命令包进沙箱
+	// - `WriteRoots` 是允许写入的白名单（工作区根目录 + `allow_write`）
+	// - `Network` 决定沙箱内是否允许网络访问
+	// 它和权限闸门（是否允许执行这条命令）以及
+	// `internal/runtime/sandbox` 的步数/时间限制是三层不同的边界。
 	bashSpec := sandbox.Spec{Mode: cfg.BashMode(), WriteRoots: cfg.WriteRootsForRoot(root), Network: cfg.Sandbox.Network}
 	shell := sandbox.ResolveShell(cfg.Tools.Shell.Prefer, cfg.Tools.Shell.Path, stderr)
 	bashSpec.Shell = shell
@@ -277,6 +287,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	if tokenEconomy {
 		enabledBuiltins = tokenEconomyBuiltins(enabledBuiltins)
 	}
+	// 内建工具先注入到 reg；随后 MCP / skill / task 等也会继续注入到同一个 reg。
 	addBuiltins(reg, enabledBuiltins, cfg.WriteRootsForRoot(root), bashSpec, bashTimeout, searchSpec, stderr, root, proxySpec)
 	// Use the caller-supplied shared host when set, so controllers for the same
 	// workspace root reuse running MCP processes (e.g. one CodeGraph daemon
@@ -369,17 +380,18 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 						// HasClient and Add, or is currently spawning it.
 						// Fetch tools from the existing client, or wait briefly.
 						tools, err2 := pluginHost.ToolsFor(ctx, s.Name)
-						if err2 == nil {
-							for _, t := range tools {
-								reg.Add(t)
-							}
-							continue
+					if err2 == nil {
+						for _, t := range tools {
+							reg.Add(t)
+						}
+						continue
 						}
 					}
 					sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn,
 						Text: fmt.Sprintf("mcp %s: %v", s.Name, err)})
 					continue
 				}
+				// MCP server 暴露出来的工具在这里注入到同一个 reg 中。
 				for _, t := range tools {
 					reg.Add(t)
 				}
@@ -387,6 +399,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		} else {
 			host, ptools := plugin.StartAvailable(ctx, eagerSpecs)
 			pluginHost = host
+			// StartAvailable 返回的 MCP 工具也直接注册进 reg，后续就会出现在模型可见的工具列表里。
 			for _, t := range ptools {
 				reg.Add(t)
 			}
@@ -830,6 +843,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		}
 		skillToolsAdded = true
 		addReadOnlySkillTools()
+		// 这里把 skill 相关工具注入 reg。模型不会直接拿到 skill body，
+		// 而是先看到这些 tool，再通过 run_skill/read_skill 等按需加载 skill。
 		reg.Add(skill.NewRunSkillTool(skillStore, skillRunner, skillProfile))
 		reg.Add(skill.NewReadSkillTool(skillStore))
 		reg.Add(skill.NewInstallSkillTool(skillStore, nil))
@@ -933,6 +948,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	if cfg.MemoryCompilerEnabled() {
 		memCompiler = memorycompiler.New(config.MemoryCompilerDir(root))
 	}
+	// 到这里为止，sysPrompt 和 reg 都已经准备好了；它们一起注入到 executor，
+	// 成为 runAgent 驱动的主 Agent 的“技能上下文 + 工具集合”。
 	executor := agent.New(execProv, reg, execSess, agent.Options{
 		MaxSteps:             maxSteps,
 		Temperature:          cfg.Agent.Temperature,

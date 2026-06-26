@@ -143,7 +143,6 @@ var syntheticPrefixes = []string{
 // returning the message to actually send to the model. The frontend keeps
 // showing the raw text as the user bubble.
 func (c *Controller) Compose(text string) string {
-	// 中文说明：
 	// Compose 的职责不是“原样返回用户输入”，而是把本轮真正需要带给模型、
 	// 但又不应该直接显示成用户气泡的控制信息，按顺序拼接到用户文本前面。
 	//
@@ -264,6 +263,10 @@ func shouldAutoStartResearchGoal(input string) bool {
 		return false
 	}
 	lower := strings.ToLower(trimmed)
+	// 这里同样是硬编码意图识别，但目标不是 plan，而是判断
+	// “这是否像一个长周期、需要持续记状态的研究/排查/优化任务”。
+	// 之所以不用纯模型决定，是因为 AutoResearch 会创建本地状态目录并改变
+	// 后续执行策略，触发门槛需要更稳定、更可审计。
 	if strings.Contains(lower, ".reasonix/autoresearch/") {
 		return true
 	}
@@ -294,6 +297,9 @@ func isAutoResearchGoal(goal string) bool {
 		return false
 	}
 	lower := strings.ToLower(trimmed)
+	// 强关键词 + 阶段数统计的组合，本质是在识别
+	// “用户是不是在要求一次持续迭代、分阶段收集证据的任务”。
+	// 这是宿主侧策略分流，所以保留少量硬编码规则比完全黑盒更容易调参与回归测试。
 	if strings.Contains(lower, ".reasonix/autoresearch/") {
 		return true
 	}

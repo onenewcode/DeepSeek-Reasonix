@@ -131,6 +131,11 @@ func Run(args []string, version string) int {
 }
 
 func isDefaultInteractiveFlag(arg string) bool {
+	// 这里是一种非常轻量的“CLI 意图识别”。
+	// 如果用户直接输入的是默认交互模式常见 flag（比如 --model、--resume），
+	// 就把这次启动路由到交互会话，而不是把第一个参数误判成子命令。
+	// 之所以硬编码，是因为这条判断必须发生在真正启动会话之前，
+	// 需要零成本、确定性、无模型依赖地完成入口分流。
 	switch arg {
 	case "--model", "--max-steps", "--continue", "-c", "--resume", "--dangerously-skip-permissions", "--yolo", "--dir":
 		return true
@@ -194,6 +199,8 @@ func configureCLIThemeFromConfigNoProbe() {
 // stdout, the TUI passes an event-channel sink so events become tea.Msgs.
 func setup(ctx context.Context, modelName string, maxStepsOverride int, requireKey bool, sink event.Sink) (*control.Controller, error) {
 	migrateMCPConfigForCLIWorkspace()
+	// runAgent 本身不直接注入 skill / tool；真正的装配入口在 boot.Build，
+	// 由它统一完成 system prompt、skill 索引、tool registry 和 Agent 的组装。
 	return boot.Build(ctx, boot.Options{
 		Model:      modelName,
 		MaxSteps:   maxStepsOverride,

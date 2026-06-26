@@ -53,6 +53,12 @@ func (c *Controller) shouldAutoPlan(ctx context.Context, input string) bool {
 	if mode == autoPlanOff || plan || c.goals.active() {
 		return false
 	}
+	// 这里先走本地启发式打分，再决定是否需要 planner / classifier。
+	// 这类“硬编码意图识别”的作用不是替代模型理解，而是把明显简单的问题、
+	// 明显复杂的任务、以及上下文依赖的短回复先做一层低成本分流：
+	// 1) 降低每轮都调 classifier 的成本和延迟；
+	// 2) 让 plan 模式切换更稳定、更可预测；
+	// 3) 避免把“好的/继续/1”之类确认语误判成需要规划的大任务。
 	score := autoPlanScore(input)
 	if score <= 0 {
 		return false
@@ -111,6 +117,10 @@ func autoPlanScore(input string) int {
 	}
 
 	score := 0
+	// 这里的长度、换行、列表、关键词、跨文件/跨层线索，
+	// 都是在估计“这更像一次需要先规划的工作任务”，而不是闲聊或单点问答。
+	// 采用硬编码特征而不是纯模型判断，是为了把最常见的 routing 决策保持在
+	// 本地同步完成，避免每次都多付一次模型成本。
 	if utf8.RuneCountInString(text) >= 160 {
 		score++
 	}
@@ -141,6 +151,11 @@ func isContextDependentShortReply(text string) bool {
 	if text == "" || strings.ContainsAny(text, "\n\r") {
 		return false
 	}
+	// 这类短回复通常是在承接上一轮上下文做确认/选择，
+	// 例如“1”“继续”“好”。把它们硬编码识别出来，可以避免：
+	// - 自动规划误触发；
+	// - planner 抢走本应由 executor 接续的上下文；
+	// - 把用户确认语误当成新的复杂任务。
 	if directOptionReplyRE.MatchString(text) || prefixedOptionReplyRE.MatchString(text) {
 		return true
 	}
@@ -263,6 +278,8 @@ func containsAny(s string, terms []string) bool {
 }
 
 var complexIntentTerms = []string{
+	// 这些词不是“语义真理”，而是产品级 routing 提示词；
+	// 命中后会提高“这像复杂实施任务”的置信度。
 	"implement", "add support", "refactor", "migrate", "redesign", "end-to-end",
 	"e2e", "wire up", "integration", "fix the issue", "build a",
 	"实现", "新增", "支持", "重构", "迁移", "改造", "端到端", "联调", "接入",
@@ -276,6 +293,8 @@ var lowRiskWorkRequestTerms = []string{
 }
 
 var multiSurfaceTerms = []string{
+	// 这些词描述“任务可能跨文件、跨层、跨关注面”，
+	// 因此常被用作需要先 plan 的信号。
 	"multiple files", "several files", "across", "frontend", "backend", "config",
 	"tests", "docs", "ui", "api", "database", "schema",
 	"多个文件", "多处", "前端", "后端", "配置", "测试", "文档", "接口", "数据库",

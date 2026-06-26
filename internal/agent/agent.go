@@ -1421,6 +1421,8 @@ func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, [
 	})
 	ch, err := a.prov.Stream(ctx, provider.Request{
 		Messages:    a.session.Messages,
+		// 当前会话里已经注入到 registry 的全部工具，会在这里导出成 schema，
+		// 并随 provider.Request 一起发给模型。
 		Tools:       a.tools.Schemas(),
 		Temperature: a.temperature,
 	})

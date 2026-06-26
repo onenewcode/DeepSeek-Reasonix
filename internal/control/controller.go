@@ -596,6 +596,9 @@ func (c *Controller) submit(input, display string) {
 		return
 	}
 	if strings.HasPrefix(trimmed, "!") {
+		// 前缀 "!" 被硬编码识别为“直接跑 shell”的用户意图。
+		// 这里不再交给模型判断，是为了让这个快捷入口保持低延迟、可预测，
+		// 同时避免普通对话被误送去执行命令。
 		c.RunShell(trimmed[1:])
 		return
 	}
@@ -629,6 +632,9 @@ func (c *Controller) submitCommandOrTurn(trimmed, input, display string, scopedR
 		runRefTurn = c.runScopedRefTurn
 		runRefTurnWithRefs = c.runScopedRefTurnWithRefs
 	}
+	// 这里用硬编码的 slash 前缀做命令意图分流。
+	// 像 /compact、/new、/clear 这类是宿主能力，不适合先问模型“这是不是命令”，
+	// 否则会增加一次模型往返、放大歧义，并削弱前端行为的一致性。
 	switch {
 	case trimmed == "/compact" || strings.HasPrefix(trimmed, "/compact "):
 		focus := strings.TrimSpace(strings.TrimPrefix(trimmed, "/compact"))
